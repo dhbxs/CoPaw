@@ -1,7 +1,8 @@
 import { useState, useEffect } from "react";
-import { Form, Input, Modal, message } from "@agentscope-ai/design";
+import { Form, Input, Modal, Select } from "@agentscope-ai/design";
 import api from "../../../../../api";
 import { useTranslation } from "react-i18next";
+import { useAppMessage } from "../../../../../hooks/useAppMessage";
 
 interface CustomProviderModalProps {
   open: boolean;
@@ -15,6 +16,7 @@ export function CustomProviderModal({
   onSaved,
 }: CustomProviderModalProps) {
   const { t } = useTranslation();
+  const { message } = useAppMessage();
   const [saving, setSaving] = useState(false);
   const [form] = Form.useForm();
 
@@ -33,6 +35,7 @@ export function CustomProviderModal({
         name: values.name.trim(),
         default_base_url: values.default_base_url?.trim() || "",
         api_key_prefix: values.api_key_prefix?.trim() || "",
+        chat_model: values.chat_model || "OpenAIChatModel",
       });
       message.success(
         t("models.providerCreated", { name: values.name.trim() }),
@@ -62,7 +65,12 @@ export function CustomProviderModal({
       cancelText={t("models.cancel")}
       destroyOnHidden
     >
-      <Form form={form} layout="vertical" style={{ marginTop: 16 }}>
+      <Form
+        form={form}
+        layout="vertical"
+        style={{ marginTop: 16 }}
+        initialValues={{ chat_model: "OpenAIChatModel" }}
+      >
         <Form.Item
           name="id"
           label={t("models.providerIdLabel")}
@@ -93,8 +101,29 @@ export function CustomProviderModal({
           <Input placeholder={t("models.defaultBaseUrlPlaceholder")} />
         </Form.Item>
 
-        <Form.Item name="api_key_prefix" label={t("models.apiKeyPrefixLabel")}>
-          <Input placeholder={t("models.apiKeyPrefixPlaceholder")} />
+        <Form.Item
+          name="chat_model"
+          label={t("models.protocol")}
+          rules={[
+            {
+              required: true,
+              message: t("models.selectProtocol"),
+            },
+          ]}
+          extra={t("models.protocolHint")}
+        >
+          <Select
+            options={[
+              {
+                value: "OpenAIChatModel",
+                label: t("models.protocolOpenAI"),
+              },
+              {
+                value: "AnthropicChatModel",
+                label: t("models.protocolAnthropic"),
+              },
+            ]}
+          />
         </Form.Item>
       </Form>
     </Modal>

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from pathlib import Path
+from typing import Optional
 
 import click
 
@@ -15,12 +17,17 @@ from ..config.config import (
     Config,
     ConsoleConfig,
     DiscordConfig,
+    TelegramConfig,
     DingTalkConfig,
     FeishuConfig,
     IMessageChannelConfig,
     QQConfig,
+    VoiceChannelConfig,
+    load_agent_config,
+    save_agent_config,
 )
 from .utils import prompt_confirm, prompt_path, prompt_select
+from .http import client, print_json, resolve_base_url
 from ..config import get_available_channels
 from ..constant import CUSTOM_CHANNELS_DIR
 from ..app.channels.registry import (
@@ -28,21 +35,25 @@ from ..app.channels.registry import (
     get_channel_registry,
 )
 
+
 # Fields that contain secrets — display masked in ``list``
 _SECRET_FIELDS = {
     "bot_token",
     "client_secret",
     "app_secret",
     "http_proxy_auth",
+    "twilio_auth_token",
 }
 
 _ALL_CHANNEL_NAMES = {
     "imessage": "iMessage",
     "discord": "Discord",
+    "telegram": "Telegram",
     "dingtalk": "DingTalk",
     "feishu": "Feishu",
     "qq": "QQ",
     "console": "Console",
+    "voice": "Twilio",
 }
 # Public alias for tests and external use.
 CHANNEL_NAMES = _ALL_CHANNEL_NAMES
@@ -74,12 +85,16 @@ class CustomChannel(BaseChannel):
         bot_prefix="",
         on_reply_sent=None,
         show_tool_details=True,
+        filter_tool_messages=False,
+        filter_thinking=False,
         **kwargs,
     ):
         super().__init__(
             process,
             on_reply_sent=on_reply_sent,
             show_tool_details=show_tool_details,
+            filter_tool_messages=filter_tool_messages,
+            filter_thinking=filter_thinking,
         )
         self.enabled = enabled
         self.bot_prefix = bot_prefix or ""
@@ -91,6 +106,7 @@ class CustomChannel(BaseChannel):
         config,
         on_reply_sent=None,
         show_tool_details=True,
+        **kwargs,
     ):
         return cls(
             process=process,
@@ -98,6 +114,14 @@ class CustomChannel(BaseChannel):
             bot_prefix=getattr(config, "bot_prefix", ""),
             on_reply_sent=on_reply_sent,
             show_tool_details=show_tool_details,
+            filter_tool_messages=kwargs.get(
+                "filter_tool_messages",
+                getattr(config, "filter_tool_messages", False),
+            ),
+            filter_thinking=kwargs.get(
+                "filter_thinking",
+                getattr(config, "filter_thinking", False),
+            ),
         )
 
     @classmethod
@@ -183,7 +207,7 @@ def configure_imessage(
 
     bot_prefix = click.prompt(
         "Bot prefix (e.g., @bot)",
-        default=current_config.bot_prefix or "[BOT]",
+        default=current_config.bot_prefix or "",
         type=str,
     )
     current_config.bot_prefix = bot_prefix
@@ -221,7 +245,7 @@ def configure_discord(current_config: DiscordConfig) -> DiscordConfig:
 
     bot_prefix = click.prompt(
         "Bot prefix (e.g., @bot)",
-        default=current_config.bot_prefix or "[BOT]",
+        default=current_config.bot_prefix or "",
         type=str,
     )
     current_config.bot_prefix = bot_prefix
@@ -286,7 +310,7 @@ def configure_dingtalk(current_config: DingTalkConfig) -> DingTalkConfig:
 
     bot_prefix = click.prompt(
         "Bot prefix (e.g., @bot)",
-        default=current_config.bot_prefix or "[BOT]",
+        default=current_config.bot_prefix or "",
         type=str,
     )
     current_config.bot_prefix = bot_prefix
@@ -324,9 +348,19 @@ def configure_feishu(current_config: FeishuConfig) -> FeishuConfig:
 
     current_config.enabled = True
 
+    # Domain selection: feishu (China) or lark (International)
+    domain_choices = ["feishu", "lark"]
+    current_domain = current_config.domain or "feishu"
+    domain = click.prompt(
+        "Region (feishu for China, lark for International)",
+        default=current_domain,
+        type=click.Choice(domain_choices),
+    )
+    current_config.domain = domain
+
     bot_prefix = click.prompt(
         "Bot prefix (e.g., @bot)",
-        default=current_config.bot_prefix or "[BOT]",
+        default=current_config.bot_prefix or "",
         type=str,
     )
     current_config.bot_prefix = bot_prefix
@@ -366,7 +400,7 @@ def configure_qq(current_config: QQConfig) -> QQConfig:
 
     bot_prefix = click.prompt(
         "Bot prefix (e.g., @bot)",
-        default=current_config.bot_prefix or "[BOT]",
+        default=current_config.bot_prefix or "",
         type=str,
     )
     current_config.bot_prefix = bot_prefix
@@ -385,6 +419,188 @@ def configure_qq(current_config: QQConfig) -> QQConfig:
         type=str,
     )
     current_config.client_secret = client_secret
+
+    markdown_enabled = prompt_confirm(
+        "Enable QQ markdown replies?",
+        default=current_config.markdown_enabled,
+    )
+    current_config.markdown_enabled = markdown_enabled
+
+    return current_config
+
+
+def configure_telegram(current_config: TelegramConfig) -> TelegramConfig:
+    """Configure Telegram channel interactively."""
+    click.echo("\n=== Configure Telegram Channel ===")
+
+    enabled = prompt_confirm(
+        "Enable Telegram channel?",
+        default=current_config.enabled,
+    )
+
+    if not enabled:
+        current_config.enabled = False
+        return current_config
+
+    current_config.enabled = True
+
+    bot_prefix = click.prompt(
+        "Bot prefix (e.g., @bot)",
+        default=current_config.bot_prefix or "",
+        type=str,
+    )
+    current_config.bot_prefix = bot_prefix
+
+    bot_token = click.prompt(
+        "Telegram Bot Token",
+        default=current_config.bot_token or "",
+        hide_input=True,
+        type=str,
+    )
+    token = bot_token.strip()
+    current_config.bot_token = token
+    if not token:
+        click.echo("Warning: Empty bot token provided.")
+        click.echo("Disabling Telegram channel.")
+        current_config.enabled = False
+        return current_config
+
+    show_typing = prompt_confirm(
+        "Show typing indicator?",
+        default=current_config.show_typing is not False,
+    )
+    current_config.show_typing = show_typing
+
+    use_proxy = prompt_confirm(
+        "Use HTTP proxy?",
+        default=bool(current_config.http_proxy),
+    )
+
+    if use_proxy:
+        http_proxy = click.prompt(
+            "HTTP proxy address (e.g., http://127.0.0.1:7890)",
+            default=current_config.http_proxy or "",
+            type=str,
+        )
+        current_config.http_proxy = http_proxy
+
+        use_proxy_auth = prompt_confirm(
+            "Does proxy require authentication?",
+            default=bool(current_config.http_proxy_auth),
+        )
+
+        if use_proxy_auth:
+            http_proxy_auth = click.prompt(
+                "Proxy authentication (format: username:password)",
+                default=current_config.http_proxy_auth or "",
+                hide_input=True,
+                type=str,
+            )
+            current_config.http_proxy_auth = http_proxy_auth
+        else:
+            current_config.http_proxy_auth = ""
+    else:
+        current_config.http_proxy = ""
+        current_config.http_proxy_auth = ""
+
+    return current_config
+
+
+def configure_voice(
+    current_config: VoiceChannelConfig,
+) -> VoiceChannelConfig:
+    """Configure Twilio voice channel interactively."""
+    click.echo("\n=== Configure Twilio Channel ===")
+
+    enabled = prompt_confirm(
+        "Enable Twilio channel?",
+        default=current_config.enabled,
+    )
+
+    if not enabled:
+        current_config.enabled = False
+        return current_config
+
+    current_config.enabled = True
+
+    # — Twilio credentials —
+
+    twilio_account_sid = click.prompt(
+        "Twilio Account SID",
+        default=current_config.twilio_account_sid or "",
+        type=str,
+    )
+    current_config.twilio_account_sid = twilio_account_sid
+
+    twilio_auth_token = click.prompt(
+        "Twilio Auth Token",
+        default=current_config.twilio_auth_token or "",
+        hide_input=True,
+        type=str,
+    )
+    current_config.twilio_auth_token = twilio_auth_token
+
+    # — Phone number (may be blank if provisioning later via API) —
+
+    phone_number = click.prompt(
+        "Phone number (e.g., +15551234567, blank to provision later)",
+        default=current_config.phone_number or "",
+        type=str,
+    )
+    current_config.phone_number = phone_number
+
+    phone_number_sid = click.prompt(
+        "Phone Number SID (e.g., PN..., blank to provision later)",
+        default=current_config.phone_number_sid or "",
+        type=str,
+    )
+    current_config.phone_number_sid = phone_number_sid
+
+    # — TTS / STT settings —
+
+    configure_tts = prompt_confirm(
+        "Configure TTS/STT settings? (default: Google TTS + Deepgram STT)",
+        default=False,
+    )
+
+    if configure_tts:
+        tts_provider = click.prompt(
+            "TTS provider",
+            default=current_config.tts_provider or "google",
+            type=str,
+        )
+        current_config.tts_provider = tts_provider
+
+        tts_voice = click.prompt(
+            "TTS voice",
+            default=current_config.tts_voice or "en-US-Journey-D",
+            type=str,
+        )
+        current_config.tts_voice = tts_voice
+
+        stt_provider = click.prompt(
+            "STT provider",
+            default=current_config.stt_provider or "deepgram",
+            type=str,
+        )
+        current_config.stt_provider = stt_provider
+
+        language = click.prompt(
+            "Language",
+            default=current_config.language or "en-US",
+            type=str,
+        )
+        current_config.language = language
+
+    # — Welcome greeting —
+
+    welcome_greeting = click.prompt(
+        "Welcome greeting",
+        default=current_config.welcome_greeting
+        or "Hi! This is CoPaw. How can I help you?",
+        type=str,
+    )
+    current_config.welcome_greeting = welcome_greeting
 
     return current_config
 
@@ -406,7 +622,7 @@ def configure_console(current_config: ConsoleConfig) -> ConsoleConfig:
 
     bot_prefix = click.prompt(
         "Bot prefix (e.g., [BOT])",
-        default=current_config.bot_prefix or "[BOT] ",
+        default=current_config.bot_prefix or "",
         type=str,
     )
     current_config.bot_prefix = bot_prefix
@@ -420,10 +636,12 @@ def configure_console(current_config: ConsoleConfig) -> ConsoleConfig:
 _ALL_CHANNEL_CONFIGURATORS = {
     "imessage": ("iMessage", configure_imessage),
     "discord": ("Discord", configure_discord),
+    "telegram": ("Telegram", configure_telegram),
     "dingtalk": ("DingTalk", configure_dingtalk),
     "feishu": ("Feishu", configure_feishu),
     "qq": ("QQ", configure_qq),
     "console": ("Console", configure_console),
+    "voice": ("Twilio", configure_voice),
 }
 
 
@@ -481,7 +699,7 @@ def get_channel_configurators() -> dict:
             "enabled",
             prompt_confirm("Enable this channel?", default=enabled),
         )
-        prefix = _get(current, "bot_prefix", "") or "[BOT]"
+        prefix = _get(current, "bot_prefix", "") or ""
         _set(
             current,
             "bot_prefix",
@@ -627,41 +845,51 @@ def _channel_enabled(ch) -> bool:
 
 
 @channels_group.command("list")
-def list_cmd() -> None:
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+def list_cmd(agent_id: str) -> None:
     """Show current channel configuration."""
-    config_path = get_config_path()
+    try:
+        agent_config = load_agent_config(agent_id)
+        click.echo(f"Channels for agent: {agent_id}\n")
 
-    if not config_path.is_file():
-        click.echo(f"Config not found: {config_path}")
-        click.echo("Will load default config.")
-        click.echo("Run `copaw channels config` to create one.")
-        cfg = load_config()
-    else:
-        cfg = load_config(config_path)
+        if not agent_config.channels:
+            click.echo("No channels configured for this agent.")
+            return
 
-    extra = getattr(cfg.channels, "__pydantic_extra__", None) or {}
-    for key, name in _get_channel_names().items():
-        ch = getattr(cfg.channels, key, None)
-        if ch is None:
-            ch = extra.get(key)
-        if ch is None:
-            continue
-        status = (
-            click.style("enabled", fg="green")
-            if _channel_enabled(ch)
-            else click.style("disabled", fg="red")
+        extra = (
+            getattr(agent_config.channels, "__pydantic_extra__", None) or {}
         )
-        click.echo(f"\n{'─' * 40}")
-        click.echo(f"  {name}  [{status}]")
-        click.echo(f"{'─' * 40}")
-
-        for field_name, value in _channel_config_fields(ch):
-            display = (
-                _mask(str(value)) if field_name in _SECRET_FIELDS else value
+        for key, name in _get_channel_names().items():
+            ch = getattr(agent_config.channels, key, None)
+            if ch is None:
+                ch = extra.get(key)
+            if ch is None:
+                continue
+            status = (
+                click.style("enabled", fg="green")
+                if _channel_enabled(ch)
+                else click.style("disabled", fg="red")
             )
-            click.echo(f"  {field_name:20s}: {display}")
+            click.echo(f"\n{'─' * 40}")
+            click.echo(f"  {name}  [{status}]")
+            click.echo(f"{'─' * 40}")
 
-    click.echo()
+            for field_name, value in _channel_config_fields(ch):
+                display = (
+                    _mask(str(value))
+                    if field_name in _SECRET_FIELDS
+                    else value
+                )
+                click.echo(f"  {field_name:20s}: {display}")
+
+        click.echo()
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1) from e
 
 
 def _install_channel_to_dir(
@@ -683,8 +911,6 @@ def _install_channel_to_dir(
     dest_dir = CUSTOM_CHANNELS_DIR / key
 
     if from_path:
-        from pathlib import Path
-
         src = Path(from_path).resolve()
         if not src.exists():
             click.echo(f"Path not found: {src}", err=True)
@@ -862,17 +1088,136 @@ def remove_cmd(key: str, keep_config: bool) -> None:
 
 
 @channels_group.command("config")
-def configure_cmd() -> None:
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+def configure_cmd(agent_id: str) -> None:
     """Interactively configure channels."""
-    config_path = get_config_path()
-    working_dir = config_path.parent
+    try:
+        agent_config = load_agent_config(agent_id)
+        click.echo(f"Configuring channels for agent: {agent_id}\n")
 
-    click.echo(f"Working dir: {working_dir}")
-    working_dir.mkdir(parents=True, exist_ok=True)
+        # Create a temporary Config object for the interactive configurator
+        temp_config = Config()
+        temp_config.channels = (
+            agent_config.channels
+            if agent_config.channels
+            else temp_config.channels
+        )
 
-    existing = load_config(config_path) if config_path.is_file() else Config()
+        configure_channels_interactive(temp_config)
 
-    configure_channels_interactive(existing)
+        # Save back to agent config
+        agent_config.channels = temp_config.channels
+        save_agent_config(agent_id, agent_config)
+        click.echo(f"\n✓ Configuration saved for agent {agent_id}")
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1) from e
 
-    save_config(existing, config_path)
-    click.echo(f"\n✓ Configuration saved to {config_path}")
+
+@channels_group.command("send")
+@click.option(
+    "--agent-id",
+    required=True,
+    help="Agent ID sending the message",
+)
+@click.option(
+    "--channel",
+    required=True,
+    help=(
+        "Target channel (e.g., console, dingtalk, feishu, discord, "
+        "imessage, qq)"
+    ),
+)
+@click.option(
+    "--target-user",
+    required=True,
+    help=("Target user ID (REQUIRED, get from 'copaw chats list' query)"),
+)
+@click.option(
+    "--target-session",
+    required=True,
+    help=("Target session ID (REQUIRED, get from 'copaw chats list' query)"),
+)
+@click.option(
+    "--text",
+    required=True,
+    help="Text message to send",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="Override the API base URL. Defaults to global --host/--port.",
+)
+@click.pass_context
+def send_cmd(
+    ctx: click.Context,
+    agent_id: str,
+    channel: str,
+    target_user: str,
+    target_session: str,
+    text: str,
+    base_url: Optional[str],
+) -> None:
+    """Send a text message to a channel.
+
+    This command allows an agent to proactively send messages to users
+    via configured channels (console, dingtalk, feishu, etc.).
+
+    IMPORTANT: All 5 parameters are REQUIRED. You MUST query first to get
+    valid target-user and target-session values.
+
+    \b
+    Complete Usage Flow:
+      Step 1 - Query available sessions (REQUIRED):
+        copaw chats list --agent-id my_bot --channel console
+
+      Step 2 - Extract parameters from query output:
+        user_id: "alice"
+        session_id: "alice_session_001"
+
+      Step 3 - Send message using queried parameters:
+        copaw channels send --agent-id my_bot --channel console \\
+          --target-user alice --target-session alice_session_001 \\
+          --text "Hello!"
+
+    \b
+    Examples with jq automation:
+      # Query and auto-extract parameters
+      SESSIONS=$(copaw chats list --agent-id bot --channel console)
+      USER=$(echo "$SESSIONS" | jq -r '.[0].user_id')
+      SESSION=$(echo "$SESSIONS" | jq -r '.[0].session_id')
+
+      # Send message
+      copaw channels send --agent-id bot --channel console \\
+        --target-user "$USER" --target-session "$SESSION" \\
+        --text "Automated notification"
+
+    \b
+    Prerequisites:
+      1. MUST use 'copaw chats list' to get valid target-user and
+         target-session
+      2. Ensure the channel is properly configured
+      3. All 5 parameters are required (no defaults)
+
+    \b
+    Returns:
+      JSON response with success status and message details.
+    """
+    base_url = resolve_base_url(ctx, base_url)
+
+    payload = {
+        "channel": channel,
+        "target_user": target_user,
+        "target_session": target_session,
+        "text": text,
+    }
+
+    with client(base_url) as c:
+        headers = {"X-Agent-Id": agent_id}
+        r = c.post("/messages/send", json=payload, headers=headers)
+        r.raise_for_status()
+        print_json(r.json())

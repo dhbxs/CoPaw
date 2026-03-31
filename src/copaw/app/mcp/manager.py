@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any, Dict, List, TYPE_CHECKING
 
 from agentscope.mcp import HttpStatefulClient, StdIOStatefulClient
@@ -50,7 +51,9 @@ class MCPClientManager:
             try:
                 await self._add_client(key, client_config)
                 logger.debug(f"MCP client '{key}' initialized successfully")
-            except Exception as e:
+            except BaseException as e:
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise
                 logger.warning(
                     f"Failed to initialize MCP client '{key}': {e}",
                     exc_info=True,
@@ -95,21 +98,8 @@ class MCPClientManager:
         try:
             # Add timeout to prevent indefinite blocking
             await asyncio.wait_for(new_client.connect(), timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"Timeout connecting MCP client '{key}' after {timeout}s",
-            )
-            try:
-                await new_client.close()
-            except Exception:
-                pass
-            raise
-        except Exception as e:
-            logger.warning(f"Failed to connect MCP client '{key}': {e}")
-            try:
-                await new_client.close()
-            except Exception:
-                pass
+        except BaseException:
+            await self._force_cleanup_client(new_client)
             raise
 
         # 2. Swap and close old client inside lock
@@ -176,27 +166,89 @@ class MCPClientManager:
         """
         client = self._build_client(client_config)
 
-        # Add timeout to prevent indefinite blocking
-        await asyncio.wait_for(client.connect(), timeout=timeout)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=timeout)
+        except BaseException:
+            await self._force_cleanup_client(client)
+            raise
 
         async with self._lock:
             self._clients[key] = client
 
     @staticmethod
+    async def _force_cleanup_client(client: Any) -> None:
+        """Force-close a client whose ``connect()`` was interrupted.
+
+        ``StatefulClientBase.close()`` refuses to run when
+        ``is_connected`` is still ``False`` (which is the case when
+        ``connect()`` times out or raises).  We bypass that guard by
+        closing the ``AsyncExitStack`` directly — this triggers the
+        ``stdio_client`` finally-block that sends SIGTERM/SIGKILL to
+        the child process.
+
+        The ``ClientSession`` is registered on the same stack via
+        ``enter_async_context``, so ``stack.aclose()`` exits it in
+        LIFO order — no separate session teardown is needed.
+        """
+        if client is None:
+            return
+
+        stack = getattr(client, "stack", None)
+        if stack is None:
+            return
+
+        try:
+            await stack.aclose()
+        except Exception:
+            logger.debug(
+                "Error during force-cleanup of MCP client",
+                exc_info=True,
+            )
+        finally:
+            for attr, default in (
+                ("stack", None),
+                ("session", None),
+                ("is_connected", False),
+            ):
+                try:
+                    setattr(client, attr, default)
+                except Exception:
+                    pass
+
+    @staticmethod
     def _build_client(client_config: "MCPClientConfig") -> Any:
         """Build MCP client instance by configured transport."""
+        rebuild_info = {
+            "name": client_config.name,
+            "transport": client_config.transport,
+            "url": client_config.url,
+            "headers": client_config.headers or None,
+            "command": client_config.command,
+            "args": list(client_config.args),
+            "env": dict(client_config.env),
+            "cwd": client_config.cwd or None,
+        }
+
         if client_config.transport == "stdio":
-            return StdIOStatefulClient(
+            client = StdIOStatefulClient(
                 name=client_config.name,
                 command=client_config.command,
                 args=client_config.args,
                 env=client_config.env,
                 cwd=client_config.cwd or None,
             )
+            setattr(client, "_copaw_rebuild_info", rebuild_info)
+            return client
 
-        return HttpStatefulClient(
+        headers = client_config.headers
+        if headers:
+            headers = {k: os.path.expandvars(v) for k, v in headers.items()}
+
+        client = HttpStatefulClient(
             name=client_config.name,
             transport=client_config.transport,
             url=client_config.url,
-            headers=client_config.headers or None,
+            headers=headers or None,
         )
+        setattr(client, "_copaw_rebuild_info", rebuild_info)
+        return client

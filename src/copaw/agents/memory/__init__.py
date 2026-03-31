@@ -2,11 +2,11 @@
 """Memory management module for CoPaw agents."""
 
 from .agent_md_manager import AgentMdManager
-from .copaw_memory import CoPawInMemoryMemory
-from .memory_manager import MemoryManager
+from .base_memory_manager import BaseMemoryManager
+from .reme_light_memory_manager import ReMeLightMemoryManager
 
 __all__ = [
     "AgentMdManager",
-    "CoPawInMemoryMemory",
-    "MemoryManager",
+    "BaseMemoryManager",
+    "ReMeLightMemoryManager",
 ]
